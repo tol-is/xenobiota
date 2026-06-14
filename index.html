@@ -161,10 +161,17 @@
 
       // ── direct interaction ─────────────────────────────────────────────
       const GRAB_RADIUS = 110;
-      const GRAB_SPRING = 90;
+      const GRAB_SPRING = 52; // soft while grounded → it lags and stretches, gripping the floor
       const GRAB_DAMP = 9;
       const PANIC_SPIN = 9;
       const FLING_MAX = 1500;
+      // lift-off: drag a grabbed critter past LIFT_DIST and it tears free of the
+      // floor — legs retract, it balls into a blob clamped under the cursor that
+      // you can drop (slow release) or throw (fast release)
+      const LIFT_DIST = 300;
+      const LIFT_SPRING = 240;
+      const LIFT_DAMP = 15;
+      const LIFT_GROW = 1.2;
       const MIN_LIMB = 0.95;
       const HEAD_EASE = 3.6;
       const WAKE_RADIUS = 256;
@@ -374,6 +381,7 @@
       const canvas = document.getElementById("c");
       const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
       let teardown = null;
+      let liftedNow = false; // true while a lifted blob is held — drives the cursor swell
 
       function start() {
         if (teardown) teardown();
@@ -521,7 +529,7 @@
               const dd = (d.x - M.downX) ** 2 + (d.y - M.downY) ** 2;
               if (dd < bestD) { bestD = dd; best = d; }
             }
-            if (best) grabbed = best;
+            if (best) { grabbed = best; grabbed.lifted = false; }
           }
           // release → fling (also clears when the cursor leaves the window)
           if (grabbed && !M.press) {
@@ -532,9 +540,16 @@
               grabbed.vy = pvy * f;
             }
             grabbed.scared = SCARE_TIME; // let go → bolt away in fright
+            grabbed.lifted = false; // back on its feet — legs spring out, it scurries off
             grabbed = null;
           }
           if (grabbed && dropIndex(grabbed) < 0) grabbed = null;
+          // drag far enough and the critter lifts off the floor (latched until release)
+          if (grabbed && M.press && !grabbed.lifted &&
+              Math.hypot(M.x - M.downX, M.y - M.downY) > LIFT_DIST) {
+            grabbed.lifted = true;
+          }
+          liftedNow = !!(grabbed && grabbed.lifted);
 
           for (let i = 0; i < drops.length; i++) {
             const d = drops[i];
@@ -545,13 +560,15 @@
             }
             const baseR = rOf(d.vol);
             const panic = d === grabbed;
+            const liftTarget = panic && d.lifted ? 1 : 0;
+            d.liftAnim = (d.liftAnim || 0) + (liftTarget - (d.liftAnim || 0)) * Math.min(1, dt * 9);
             const pred = d.absorbedBy && dropIndex(d.absorbedBy) >= 0 ? d.absorbedBy : null;
             const absorbing = pred !== null && !panic;
 
             let target = d.wander;
             let seeking = false;
             if (panic) {
-              d.head += PANIC_SPIN * dt;
+              d.head += PANIC_SPIN * (d.lifted ? 0.25 : 1) * dt;
               d.chasing = false;
               d.cool = Math.max(d.cool, 0.15);
             } else if (absorbing && pred) {
@@ -632,6 +649,14 @@
             let thrust = 0;
             for (let l = 0; l < K_LIMB; l++) {
               const lm = d.limbs[l];
+              if (d.lifted) {
+                // hauled off the floor: legs reel in toward the body → it balls up
+                const rr = Math.min(1, dt * 9);
+                lm.ax += (d.x - lm.ax) * rr;
+                lm.ay += (d.y - lm.ay) * rr;
+                lm.grip = false;
+                continue;
+              }
               const rate = d.gaitRate * (d.scared > 0 ? FLEE_GAIT : d.chasing ? CHASE_GAIT : 1) * lm.rm;
               const ph = (elapsed * rate) / LIMB_CYCLE + lm.ph;
               const fl = Math.floor(ph);
@@ -659,9 +684,13 @@
 
             if (!reduceMotion) {
               if (panic) {
-                d.vx += (M.x - d.x) * GRAB_SPRING * dt;
-                d.vy += (M.y - d.y) * GRAB_SPRING * dt;
-                const gdamp = Math.exp(-dt * GRAB_DAMP);
+                // lifted → a stiff, well-damped clamp so it tracks the cursor
+                // tightly; grounded → the looser, springier struggle
+                const spr = d.lifted ? LIFT_SPRING : GRAB_SPRING;
+                const dmp = d.lifted ? LIFT_DAMP : GRAB_DAMP;
+                d.vx += (M.x - d.x) * spr * dt;
+                d.vy += (M.y - d.y) * spr * dt;
+                const gdamp = Math.exp(-dt * dmp);
                 d.vx *= gdamp;
                 d.vy *= gdamp;
               } else if (absorbing && pred) {
@@ -756,13 +785,14 @@
           let segN = 0;
           for (let i = 0; i < drops.length; i++) {
             const d = drops[i];
-            const r = rOf(d.vol) * (1 + BREATHE * Math.sin(elapsed * 1.3 + d.phase));
+            const la = d.liftAnim || 0;
+            const r = rOf(d.vol) * (1 + BREATHE * Math.sin(elapsed * 1.3 + d.phase)) * (1 + (LIFT_GROW - 1) * la);
             const o = i * 4;
             dropBuf[o] = d.x * dpr;
             dropBuf[o + 1] = d.y * dpr;
             dropBuf[o + 2] = r * dpr;
             dropBuf[o + 3] = d.conc;
-            const minLen = r * MIN_LIMB;
+            const minLen = r * (MIN_LIMB - (MIN_LIMB - 0.12) * la);
             for (let l = 0; l < K_LIMB && segN < MAX_SEG; l++) {
               const lm = d.limbs[l];
               let tx = lm.ax;
@@ -837,7 +867,7 @@
           // stretch along travel direction, contract on press
           const stretch = Math.min(0.9, sp * 0.05);
           const ang = (Math.atan2(vy, vx) * 180) / Math.PI;
-          const scale = M.press ? 0.6 : 1;
+          const scale = liftedNow ? 1.8 : M.press ? 0.6 : 1;
           blob.style.transform =
             `translate(${bx}px, ${by}px) rotate(${ang}deg) ` +
             `scale(${scale * (1 + stretch)}, ${scale * (1 - stretch * 0.6)})`;
