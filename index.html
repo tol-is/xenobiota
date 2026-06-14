@@ -93,12 +93,17 @@
         33% { border-radius: 58% 42% 45% 55% / 42% 58% 42% 58%; }
         66% { border-radius: 42% 58% 60% 40% / 52% 44% 56% 48%; }
       }
-      /* credit link — sits above the canvas, bottom-right */
-      #credit {
+      /* footer — sits above the canvas, bottom-right */
+      #footer {
         position: fixed;
         right: 16px;
         bottom: 14px;
         z-index: 2;
+        display: flex;
+        gap: 16px;
+        mix-blend-mode: multiply;
+      }
+      #footer a {
         font-family: "NeueBit", monospace;
         font-size: 15px;
         letter-spacing: 0.06em;
@@ -107,10 +112,9 @@
         text-decoration: none;
         opacity: 0.55;
         transition: opacity 0.2s ease;
-        mix-blend-mode: multiply;
         cursor: none;
       }
-      #credit:hover {
+      #footer a:hover {
         opacity: 1;
       }
     </style>
@@ -118,7 +122,10 @@
   <body>
     <canvas id="c"></canvas>
     <div id="blob"></div>
-    <a id="credit" href="https://tol.is" target="_blank" rel="noopener" onpointerdown="event.stopPropagation()">tol.is</a>
+    <div id="footer">
+      <a href="https://github.com/tol-is/xenobiota" target="_blank" rel="noopener" onpointerdown="event.stopPropagation()">github</a>
+      <a href="https://tol.is" target="_blank" rel="noopener" onpointerdown="event.stopPropagation()">tol.is</a>
+    </div>
     <script>
       // Xenobiota — a metaball-SDF colony of alien black goo
       // that crawls on tendril-limbs, stalks the cursor, coalesces and scatters.
@@ -194,6 +201,28 @@
       const SCARE_TIME = 1.7; // seconds of panicked fleeing after release
       const FLEE_PULL = 17; // hard sprint away from the cursor
       const FLEE_GAIT = 3.1; // legs churn fast while fleeing
+
+      // ── play (kid antics: leap, tag, roughhouse, twitch) ───────────────
+      // leap / pounce: occasional crouch-and-launch with real airtime
+      const LEAP_TIME = 0.52; // airborne duration (s)
+      const LEAP_PUSH = 640; // forward launch impulse (px/s)
+      const LEAP_GAP_MIN = 4.5;
+      const LEAP_GAP_MAX = 11; // roaming leaps are rare; pounces (chase/tag) fire faster
+      // play tag: kids chase a playmate, tag on contact, swap roles, scatter
+      const TAG_TIME = 4.5; // bout length (s)
+      const TAG_CD = 7; // cooldown before a kid will play again
+      const TAG_RANGE = 270; // start a bout with a playmate within this
+      const TAG_PULL = 8.5; // chase/run thrust during a bout
+      const TAG_START_RATE = 0.4; // bout-starts per second per eligible kid
+      const MAX_TAG_PAIRS = 1;
+      const TAG_PLAY_MIN = 0.82; // only the small/kid critters play tag
+      // roughhouse: small ones sometimes bounce apart instead of merging
+      const ROUGH_CHANCE = 0.6;
+      const ROUGH_MAXVOL = 1.4;
+      const ROUGH_PUSH = 210;
+      // startle: random little spook-hops and direction snaps
+      const TWITCH_GAP_MIN = 4;
+      const TWITCH_GAP_MAX = 12;
 
       const hash = (n) => {
         const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
@@ -599,6 +628,72 @@
           }
           liftedNow = !!(grabbed && grabbed.lifted);
 
+          // ── play tag: kids pick a playmate, chase, tag on contact, swap ───
+          const tagEligible = (d) =>
+            !d.playmate && (d.tagCd || 0) <= 0 && (d.tagT || 0) <= 0 &&
+            d !== grabbed && !d.absorbedBy && !d.entering && d.scared <= 0 &&
+            !d.chasing && (d.play || 0) > TAG_PLAY_MIN;
+          let tagPairs = 0;
+          for (let i = 0; i < drops.length; i++) {
+            const d = drops[i];
+            if (d.tagCd > 0) d.tagCd -= dt;
+            if (d.tagGrace > 0) d.tagGrace -= dt;
+            const pm = d.playmate;
+            // partner gone or yanked into another state → end this kid's bout
+            if (pm && (dropIndex(pm) < 0 || pm.playmate !== d || d === grabbed || d.absorbedBy)) {
+              d.playmate = null; d.tagT = 0; d.tagCd = TAG_CD;
+            }
+          }
+          for (let i = 0; i < drops.length; i++) {
+            const d = drops[i];
+            if (!d.playmate || (d.tagT || 0) <= 0) continue;
+            if (i >= dropIndex(d.playmate)) continue; // run each pair once
+            const pm = d.playmate;
+            d.tagT -= dt;
+            pm.tagT = d.tagT;
+            tagPairs++;
+            // contact → "tag!": swap who's it, squish both, runner bursts away
+            const rr = rOf(d.vol) + rOf(pm.vol);
+            const dx = d.x - pm.x, dy = d.y - pm.y;
+            if (d.tagGrace <= 0 && dx * dx + dy * dy < rr * rr) {
+              d.tagIt = !d.tagIt; pm.tagIt = !pm.tagIt;
+              d.tagGrace = pm.tagGrace = 0.8;
+              d.squishT = pm.squishT = SQUISH_TIME;
+              const runner = d.tagIt ? pm : d;
+              const it = d.tagIt ? d : pm;
+              const a = Math.atan2(runner.y - it.y, runner.x - it.x);
+              runner.vx += Math.cos(a) * 270;
+              runner.vy += Math.sin(a) * 270;
+            }
+            if (d.tagT <= 0) {
+              d.playmate = pm.playmate = null;
+              d.tagT = pm.tagT = 0;
+              d.tagCd = pm.tagCd = TAG_CD;
+            }
+          }
+          // open new bouts between eligible kids that are near each other
+          if (tagPairs < MAX_TAG_PAIRS && !reduceMotion) {
+            for (let i = 0; i < drops.length && tagPairs < MAX_TAG_PAIRS; i++) {
+              const a = drops[i];
+              if (!tagEligible(a)) continue;
+              let best = null, bestD = TAG_RANGE * TAG_RANGE;
+              for (let j = 0; j < drops.length; j++) {
+                if (j === i) continue;
+                const b = drops[j];
+                if (!tagEligible(b)) continue;
+                const dd = (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+                if (dd < bestD) { bestD = dd; best = b; }
+              }
+              if (best && rnd() < dt * TAG_START_RATE) {
+                a.playmate = best; best.playmate = a;
+                a.tagT = best.tagT = TAG_TIME;
+                a.tagIt = true; best.tagIt = false; // a is "it"
+                a.tagGrace = best.tagGrace = 0.5;
+                tagPairs++;
+              }
+            }
+          }
+
           for (let i = 0; i < drops.length; i++) {
             const d = drops[i];
             if (d.cool > 0) d.cool -= dt;
@@ -610,17 +705,26 @@
             const baseR = rOf(d.vol);
             // smaller critters behave like kids: nimble, restless, bouncier.
             // derived from live volume so it fades as they grow up (merge).
-            d.play = Math.max(0, Math.min(1, (2.0 - d.vol) / 1.2));
+            // the smallest are lively kids; bigger ones settle down (calmer baseline)
+            d.play = 0.4 + 0.6 * Math.max(0, Math.min(1, (2.0 - d.vol) / 1.2));
             const play = d.play;
             // skip-hop: a bouncing arc (|sin| → repeated bumps that touch down
             // at 0) that lifts the body and surges it forward, then settles.
             const hopBounce = Math.abs(Math.sin(elapsed * (4 + d.gaitRate * 2) + d.phase * 1.7));
             d.hop = hopBounce * play;
+            // lazily seed the per-critter antic timers (covers split offspring)
+            if (d.leapCd === undefined) {
+              d.leapCd = LEAP_GAP_MIN + rnd() * (LEAP_GAP_MAX - LEAP_GAP_MIN);
+              d.twitchCd = TWITCH_GAP_MIN + rnd() * (TWITCH_GAP_MAX - TWITCH_GAP_MIN);
+              d.leapT = 0; d.leapLift = 0; d.tagCd = 0;
+            }
             const panic = d === grabbed;
+            const tagging = !!(d.playmate && d.tagT > 0 && dropIndex(d.playmate) >= 0);
             const liftTarget = panic && d.lifted ? 1 : 0;
             d.liftAnim = (d.liftAnim || 0) + (liftTarget - (d.liftAnim || 0)) * Math.min(1, dt * 9);
             const pred = d.absorbedBy && dropIndex(d.absorbedBy) >= 0 ? d.absorbedBy : null;
             const absorbing = pred !== null && !panic;
+            const canAct = !panic && !absorbing && !d.entering && !d.lifted;
 
             let target = d.wander;
             let seeking = false;
@@ -637,7 +741,14 @@
               d.head = Math.atan2(hy, hx);
             } else {
               if (d.scared > 0) d.scared -= dt;
-              if (d.scared > 0) {
+              if (tagging) {
+                // tag: "it" homes on the playmate, the runner bolts away from it
+                const pm = d.playmate;
+                d.chasing = false;
+                const ang = Math.atan2(pm.y - d.y, pm.x - d.x);
+                target = d.tagIt ? ang : ang + Math.PI;
+                seeking = true;
+              } else if (d.scared > 0) {
                 // fleeing: bolt directly away from the cursor (keep bolting in
                 // whatever direction if the cursor has left the window)
                 d.chasing = false;
@@ -662,7 +773,7 @@
               if (!seeking && d.entering) {
                 target = d.wander;
               } else if (!seeking && !reduceMotion) {
-                d.wander += (rnd() - 0.5) * WANDER_TURN * (1 + play * 1.8) * dt * 6;
+                d.wander += (rnd() - 0.5) * WANDER_TURN * (1 + play * 1.0) * dt * 6;
                 // steer away from walls: build an inward push vector that grows
                 // toward each edge, then turn (shortest way) toward it — strongly
                 // enough to win over the random walk, even pinned in a corner.
@@ -701,6 +812,43 @@
               d.lungeCd = LUNGE_GAP_MIN;
             }
 
+            // ── leap / pounce: crouch, launch with airtime, land with a squish
+            if (d.leapT > 0) {
+              d.leapT -= dt;
+              d.leapLift = Math.sin((1 - Math.max(0, d.leapT) / LEAP_TIME) * Math.PI);
+              if (d.leapT <= 0) { d.leapT = 0; d.leapLift = 0; d.squishT = SQUISH_TIME; }
+            } else {
+              d.leapLift = 0;
+              if (canAct && !reduceMotion) {
+                // pounces fire much sooner than idle leaps; kids leap more
+                d.leapCd -= dt * (d.chasing || tagging ? 2.2 : 0.45 + play * 0.5);
+                if (d.leapCd <= 0) {
+                  d.leapT = LEAP_TIME;
+                  const push = LEAP_PUSH * (0.6 + 0.4 * play) * d.vigor;
+                  d.vx += Math.cos(d.head) * push;
+                  d.vy += Math.sin(d.head) * push;
+                  d.squishT = Math.max(d.squishT, SQUISH_TIME * 0.6); // crouch-pop
+                  d.leapCd = LEAP_GAP_MIN + rnd() * (LEAP_GAP_MAX - LEAP_GAP_MIN);
+                }
+              }
+            }
+
+            // ── startle twitch: random spook-hop + sharp turn (kids more often)
+            if (canAct && !reduceMotion) {
+              d.twitchCd -= dt;
+              if (d.twitchCd <= 0) {
+                d.twitchCd = TWITCH_GAP_MIN + rnd() * (TWITCH_GAP_MAX - TWITCH_GAP_MIN);
+                if (rnd() < play * 0.45 && d.leapT <= 0) {
+                  d.wander += (rnd() - 0.5) * 1.5;
+                  const a = rnd() * 6.28;
+                  const pop = 70 + rnd() * 80;
+                  d.vx += Math.cos(a) * pop;
+                  d.vy += Math.sin(a) * pop;
+                  d.squishT = Math.max(d.squishT, SQUISH_TIME * 0.5);
+                }
+              }
+            }
+
             const ux = Math.cos(d.head);
             const uy = Math.sin(d.head);
             let thrust = 0;
@@ -727,7 +875,15 @@
                 lm.grip = false;
                 continue;
               }
-              const rate = d.gaitRate * (1 + play * 0.7) * (d.scared > 0 ? FLEE_GAIT : d.chasing ? CHASE_GAIT : 1) * lm.rm;
+              // airborne in a leap: tuck legs toward the body, no stride
+              if (d.leapLift > 0.25) {
+                const tuck = Math.min(1, dt * 12);
+                lm.ax += (d.x - lm.ax) * tuck;
+                lm.ay += (d.y - lm.ay) * tuck;
+                lm.grip = false;
+                continue;
+              }
+              const rate = d.gaitRate * (1 + play * 0.7) * (d.scared > 0 ? FLEE_GAIT : (d.chasing || tagging) ? CHASE_GAIT : 1) * lm.rm;
               const ph = (elapsed * rate) / LIMB_CYCLE + lm.ph;
               const fl = Math.floor(ph);
               const cyc = ph - fl;
@@ -778,12 +934,12 @@
                 d.volTarget = d.vol;
               } else {
                 const chaseThrust = STALK_CREEP + LUNGE_BOOST * d.lunge * (0.35 + 0.65 * stillness);
-                const pull = (d.scared > 0 ? FLEE_PULL : d.chasing ? CHASE_PULL * chaseThrust : on ? IDLE_PULL : WANDER_PULL) * d.vigor * (1 + play * 0.45);
+                const pull = (d.scared > 0 ? FLEE_PULL : tagging ? TAG_PULL : d.chasing ? CHASE_PULL * chaseThrust : on ? IDLE_PULL : WANDER_PULL) * d.vigor * (1 + play * 0.45);
                 const norm = REF_R / Math.max(baseR, 1);
                 d.vx += fx * pull * norm * dt;
                 d.vy += fy * pull * norm * dt;
                 // bound forward on the rise of each hop, coast on the way down
-                const hopSurge = d.hop * 560 * d.vigor;
+                const hopSurge = d.hop * 360 * d.vigor;
                 d.vx += ux * hopSurge * norm * dt;
                 d.vy += uy * hopSurge * norm * dt;
                 const damp = Math.exp(-dt * BODY_DAMP);
@@ -791,7 +947,8 @@
                 d.vy *= damp;
               }
               const v = Math.hypot(d.vx, d.vy);
-              const cap = panic ? FLING_MAX : MAX_SPEED * d.paceMul;
+              // raise the cap mid-leap so the launch impulse isn't clipped
+              const cap = panic ? FLING_MAX : d.leapT > 0 ? Math.max(MAX_SPEED * d.paceMul, LEAP_PUSH * 1.1) : MAX_SPEED * d.paceMul;
               if (v > cap) {
                 d.vx *= cap / v;
                 d.vy *= cap / v;
@@ -844,10 +1001,21 @@
               const b = drops[j];
               if (a.cool > 0 || b.cool > 0) continue;
               if (a.absorbedBy || b.absorbedBy) continue;
+              if (a.playmate === b || b.playmate === a) continue; // tag handles them
               const rr = (rOf(a.vol) + rOf(b.vol)) * MERGE_OVERLAP;
               const dx = a.x - b.x;
               const dy = a.y - b.y;
               if (dx * dx + dy * dy < rr * rr) {
+                // two small ones often just shove off each other (roughhouse)
+                if (a.vol < ROUGH_MAXVOL && b.vol < ROUGH_MAXVOL && rnd() < ROUGH_CHANCE) {
+                  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                  const nx = dx / dist, ny = dy / dist;
+                  a.vx += nx * ROUGH_PUSH; a.vy += ny * ROUGH_PUSH;
+                  b.vx -= nx * ROUGH_PUSH; b.vy -= ny * ROUGH_PUSH;
+                  a.squishT = b.squishT = SQUISH_TIME;
+                  a.cool = b.cool = Math.max(a.cool, 0.5); // brief no-merge so they part
+                  continue;
+                }
                 const predator = a.vol >= b.vol ? a : b;
                 const prey = predator === a ? b : a;
                 prey.absorbedBy = predator;
@@ -866,13 +1034,16 @@
               const p = 1 - d.squishT / SQUISH_TIME;
               sq = 1 - SQUISH_DEPTH * Math.cos(p * Math.PI * 3) * (1 - p);
             }
-            const r = rOf(d.vol) * (1 + BREATHE * (1 + (d.play || 0) * 1.5) * Math.sin(elapsed * 1.3 + d.phase)) * (1 + (d.hop || 0) * 0.16) * (1 + (LIFT_GROW - 1) * la) * sq;
+            const leapLift = d.leapLift || 0;
+            const r = rOf(d.vol) * (1 + BREATHE * (1 + (d.play || 0) * 1.5) * Math.sin(elapsed * 1.3 + d.phase)) * (1 + (d.hop || 0) * 0.16) * (1 + leapLift * 0.32) * (1 + (LIFT_GROW - 1) * la) * sq;
             const o = i * 4;
             dropBuf[o] = d.x * dpr;
             dropBuf[o + 1] = d.y * dpr;
             dropBuf[o + 2] = r * dpr;
             dropBuf[o + 3] = d.conc;
-            const minLen = r * (MIN_LIMB - (MIN_LIMB - 0.12) * la);
+            // legs reel in toward the body when grabbed (la) or airborne (leapLift)
+            const tucked = Math.max(la, leapLift * 0.85);
+            const minLen = r * (MIN_LIMB - (MIN_LIMB - 0.12) * tucked);
             for (let l = 0; l < K_LIMB && segN < MAX_SEG; l++) {
               const lm = d.limbs[l];
               let tx = lm.ax;
