@@ -206,8 +206,8 @@
       // leap / pounce: occasional crouch-and-launch with real airtime
       const LEAP_TIME = 0.52; // airborne duration (s)
       const LEAP_PUSH = 640; // forward launch impulse (px/s)
-      const LEAP_GAP_MIN = 4.5;
-      const LEAP_GAP_MAX = 11; // roaming leaps are rare; pounces (chase/tag) fire faster
+      const LEAP_GAP_MIN = 9;
+      const LEAP_GAP_MAX = 20; // roaming leaps are rare; pounces (chase/tag) fire faster
       // play tag: kids chase a playmate, tag on contact, swap roles, scatter
       const TAG_TIME = 4.5; // bout length (s)
       const TAG_CD = 7; // cooldown before a kid will play again
@@ -821,7 +821,7 @@
               d.leapLift = 0;
               if (canAct && !reduceMotion) {
                 // pounces fire much sooner than idle leaps; kids leap more
-                d.leapCd -= dt * (d.chasing || tagging ? 2.2 : 0.45 + play * 0.5);
+                d.leapCd -= dt * (d.chasing || tagging ? 2.2 : play * 0.6);
                 if (d.leapCd <= 0) {
                   d.leapT = LEAP_TIME;
                   const push = LEAP_PUSH * (0.6 + 0.4 * play) * d.vigor;
