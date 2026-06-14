@@ -3,7 +3,37 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-    <title>Critters</title>
+    <title>Xenobiota</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23111' d='M16 3c5.2 0 9.4 2.8 11.3 7.6 1.9 4.6 1.4 9.4-1.8 13.1-3.3 3.8-8.8 5.4-13.6 3.6C6.7 25.4 3 20.6 3 14.8 3 8 8.8 3 16 3z'/%3E%3C/svg%3E"
+    />
+    <meta name="theme-color" content="#eaeaea" />
+    <meta
+      name="description"
+      content="A skittish colony of alien black goo that stalks your cursor — crawling on tendril-limbs, coalescing, and scattering across the screen."
+    />
+    <meta name="author" content="tol.is" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Xenobiota" />
+    <meta
+      property="og:description"
+      content="A skittish colony of alien black goo that stalks your cursor — crawling on tendril-limbs, coalescing, and scattering across the screen."
+    />
+    <!-- NOTE: og.png must be a real static image — social scrapers can't render the WebGL canvas -->
+    <meta property="og:url" content="https://xenobiota.vercel.app/" />
+    <meta property="og:image" content="https://xenobiota.vercel.app/og.png" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Xenobiota" />
+    <meta
+      name="twitter:description"
+      content="A skittish colony of alien black goo that stalks your cursor."
+    />
+    <meta name="twitter:image" content="https://xenobiota.vercel.app/og.png" />
     <style>
       @font-face {
         font-family: "NeueBit";
@@ -86,8 +116,8 @@
     <div id="blob"></div>
     <a id="credit" href="https://tol.is" target="_blank" rel="noopener" onpointerdown="event.stopPropagation()">tol.is</a>
     <script>
-      // a metaball-SDF colony of black goo creatures
-      // that crawl on tendril-limbs, hunt the cursor, coalesce and scatter.
+      // Xenobiota — a metaball-SDF colony of alien black goo
+      // that crawls on tendril-limbs, stalks the cursor, coalesces and scatters.
 
       // ── droplet shape ──────────────────────────────────────────────────
       const BASE_R = 0.46;
@@ -145,6 +175,11 @@
       const LUNGE_GAP_MIN = 0.6;
       const LUNGE_GAP_MAX = 2.3;
       const STILL_REF = 420; // cursor speed (px/s) that suppresses darts
+
+      // ── fright (bolt away after being grabbed and released) ────────────
+      const SCARE_TIME = 1.7; // seconds of panicked fleeing after release
+      const FLEE_PULL = 17; // hard sprint away from the cursor
+      const FLEE_GAIT = 3.1; // legs churn fast while fleeing
 
       const hash = (n) => {
         const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
@@ -213,6 +248,13 @@
         float d = field(p);
         if(d > 0.0){
           col = mix(col, vec3(0.0), exp(-d / (uPitch * 0.6)) * 0.55);
+          // drifting surface fog — faint slow haze pooling on the ground plane,
+          // fading out as it approaches the critters so the shadow stays crisp
+          float f1 = n2(p * 0.0035 + vec2(uTime * 0.05, uTime * 0.03));
+          float f2 = n2(p * 0.008 - vec2(uTime * 0.04, uTime * 0.02));
+          float fog = smoothstep(0.5, 0.96, 0.5 + 0.5 * (f1 * 0.65 + f2 * 0.35));
+          float ground = smoothstep(0.0, uPitch * 1.6, d);
+          col = mix(col, uBg * 1.16, fog * 0.09 * ground * vig);
         }
         if(d < 1.5 * uDpr){
           float e = 1.5 * uDpr;
@@ -408,7 +450,7 @@
             phase: rnd() * 6.28, wander: head, head,
             vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9,
             chasing: false, entering, absorbedBy: null, limbs: mkLimbs(x, y),
-            lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX,
+            lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX, scared: 0,
           });
         };
         const spawnAt = (gx, gy, vol, conc) =>
@@ -485,6 +527,7 @@
               grabbed.vx = pvx * f;
               grabbed.vy = pvy * f;
             }
+            grabbed.scared = SCARE_TIME; // let go → bolt away in fright
             grabbed = null;
           }
           if (grabbed && dropIndex(grabbed) < 0) grabbed = null;
@@ -515,7 +558,14 @@
               const hy = Math.sin(d.head) + (Math.sin(a) - Math.sin(d.head)) * ke;
               d.head = Math.atan2(hy, hx);
             } else {
-              if (on) {
+              if (d.scared > 0) d.scared -= dt;
+              if (d.scared > 0) {
+                // fleeing: bolt directly away from the cursor (keep bolting in
+                // whatever direction if the cursor has left the window)
+                d.chasing = false;
+                target = on ? Math.atan2(d.y - M.y, d.x - M.x) : d.head;
+                seeking = true;
+              } else if (on) {
                 const dxc = M.x - d.x;
                 const dyc = M.y - d.y;
                 const dist = Math.hypot(dxc, dyc);
@@ -578,7 +628,7 @@
             let thrust = 0;
             for (let l = 0; l < K_LIMB; l++) {
               const lm = d.limbs[l];
-              const rate = d.gaitRate * (d.chasing ? CHASE_GAIT : 1) * lm.rm;
+              const rate = d.gaitRate * (d.scared > 0 ? FLEE_GAIT : d.chasing ? CHASE_GAIT : 1) * lm.rm;
               const ph = (elapsed * rate) / LIMB_CYCLE + lm.ph;
               const fl = Math.floor(ph);
               const cyc = ph - fl;
@@ -625,7 +675,7 @@
                 d.volTarget = d.vol;
               } else {
                 const chaseThrust = STALK_CREEP + LUNGE_BOOST * d.lunge * (0.35 + 0.65 * stillness);
-                const pull = (d.chasing ? CHASE_PULL * chaseThrust : (on ? IDLE_PULL : WANDER_PULL)) * d.vigor;
+                const pull = (d.scared > 0 ? FLEE_PULL : d.chasing ? CHASE_PULL * chaseThrust : on ? IDLE_PULL : WANDER_PULL) * d.vigor;
                 const norm = REF_R / Math.max(baseR, 1);
                 d.vx += fx * pull * norm * dt;
                 d.vy += fy * pull * norm * dt;
@@ -675,8 +725,8 @@
               const cY = (g) => Math.max(0, Math.min(rows - 1, g));
               drops.splice(i, 1);
               drops.push(
-                { x: d.x, y: d.y, vx: d.ax * 60, vy: d.ay * 60, cgx: cX(d.cgx + sx), cgy: cY(d.cgy + sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(d.ay, d.ax), head: Math.atan2(d.ay, d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9, chasing: d.chasing, entering: false, absorbedBy: null, lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX, limbs: mkLimbs(d.x, d.y) },
-                { x: d.x, y: d.y, vx: -d.ax * 60, vy: -d.ay * 60, cgx: cX(d.cgx - sx), cgy: cY(d.cgy - sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(-d.ay, -d.ax), head: Math.atan2(-d.ay, -d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9, chasing: d.chasing, entering: false, absorbedBy: null, lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX, limbs: mkLimbs(d.x, d.y) },
+                { x: d.x, y: d.y, vx: d.ax * 60, vy: d.ay * 60, cgx: cX(d.cgx + sx), cgy: cY(d.cgy + sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(d.ay, d.ax), head: Math.atan2(d.ay, d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9, chasing: d.chasing, entering: false, absorbedBy: null, lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX, scared: 0, limbs: mkLimbs(d.x, d.y) },
+                { x: d.x, y: d.y, vx: -d.ax * 60, vy: -d.ay * 60, cgx: cX(d.cgx - sx), cgy: cY(d.cgy - sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(-d.ay, -d.ax), head: Math.atan2(-d.ay, -d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9, chasing: d.chasing, entering: false, absorbedBy: null, lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX, scared: 0, limbs: mkLimbs(d.x, d.y) },
               );
             }
           }
