@@ -28,11 +28,36 @@
         touch-action: none;
         overscroll-behavior: none;
         font-family: "NeueBit", monospace;
+        cursor: none;
       }
       #c {
         position: fixed;
         inset: 0;
         display: block;
+      }
+      /* custom cursor — a small black blob that morphs and trails the pointer */
+      #blob {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 16px;
+        height: 16px;
+        margin: -8px 0 0 -8px;
+        /* white + difference blend → reads black over the light bg, but
+           inverts to white wherever it passes over the black creatures */
+        background: #fff;
+        mix-blend-mode: difference;
+        border-radius: 47% 53% 52% 48% / 55% 49% 51% 45%;
+        z-index: 3;
+        pointer-events: none;
+        opacity: 0;
+        will-change: transform, border-radius;
+        animation: blobMorph 3.2s ease-in-out infinite;
+      }
+      @keyframes blobMorph {
+        0%, 100% { border-radius: 47% 53% 52% 48% / 55% 49% 51% 45%; }
+        33% { border-radius: 58% 42% 45% 55% / 42% 58% 42% 58%; }
+        66% { border-radius: 42% 58% 60% 40% / 52% 44% 56% 48%; }
       }
       /* credit link — sits above the canvas, bottom-right */
       #credit {
@@ -49,6 +74,7 @@
         opacity: 0.55;
         transition: opacity 0.2s ease;
         mix-blend-mode: multiply;
+        cursor: none;
       }
       #credit:hover {
         opacity: 1;
@@ -57,6 +83,7 @@
   </head>
   <body>
     <canvas id="c"></canvas>
+    <div id="blob"></div>
     <a id="credit" href="https://tol.is" target="_blank" rel="noopener" onpointerdown="event.stopPropagation()">tol.is</a>
     <script>
       // a metaball-SDF colony of black goo creatures
@@ -104,16 +131,20 @@
       const GRAB_DAMP = 9;
       const PANIC_SPIN = 9;
       const FLING_MAX = 1500;
-      const SHOCK_RADIUS = 340;
-      const SHOCK_FORCE = 1400;
-      const SHOCK_DECAY = 3.2;
-      const SHOCK_LIFE = 1.1;
       const MIN_LIMB = 0.95;
       const HEAD_EASE = 3.6;
-      const WAKE_RADIUS = 400;
-      const LOSE_RADIUS = 760;
+      const WAKE_RADIUS = 256;
+      const LOSE_RADIUS = 512;
       const WANDER_TURN = 2;
-      const BREATHE = 0.27;
+      const BREATHE = 0.17;
+
+      // ── stalking (creep, then dart — faster when the cursor is still) ───
+      const STALK_CREEP = 0.4; // chase thrust between darts (slow creep)
+      const LUNGE_BOOST = 2.1; // extra thrust injected during a dart
+      const LUNGE_TIME = 0.34; // dart duration (s)
+      const LUNGE_GAP_MIN = 0.6;
+      const LUNGE_GAP_MAX = 2.3;
+      const STILL_REF = 420; // cursor speed (px/s) that suppresses darts
 
       const hash = (n) => {
         const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
@@ -237,7 +268,7 @@
       const GLOW = 0.299 * BG[0] + 0.587 * BG[1] + 0.114 * BG[2] < 0.5 ? 0.45 : 1.0;
 
       // ── global pointer state (attached once) ────────────────────────────
-      const M = { x: -9999, y: -9999, active: false, press: false };
+      const M = { x: -9999, y: -9999, active: false, press: false, down: 0, downX: 0, downY: 0 };
       addEventListener("mousemove", (e) => {
         M.x = e.clientX;
         M.y = e.clientY;
@@ -262,8 +293,11 @@
       addEventListener("pointerdown", (e) => {
         M.x = e.clientX;
         M.y = e.clientY;
+        M.downX = e.clientX;
+        M.downY = e.clientY;
         M.active = true;
         M.press = true;
+        M.down++; // latch: consumed by the loop so fast clicks aren't missed
       });
       addEventListener("pointerup", () => {
         M.press = false;
@@ -280,8 +314,11 @@
         if (!t) return;
         M.x = t.clientX;
         M.y = t.clientY;
+        M.downX = t.clientX;
+        M.downY = t.clientY;
         M.active = true;
         M.press = true;
+        M.down++;
       }, { passive: true });
       addEventListener("touchend", () => {
         M.active = false;
@@ -369,8 +406,9 @@
             vol, volTarget: vol, conc, stretch: 0,
             ax: Math.cos(head), ay: Math.sin(head), cool: 0,
             phase: rnd() * 6.28, wander: head, head,
-            vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8,
+            vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9,
             chasing: false, entering, absorbedBy: null, limbs: mkLimbs(x, y),
+            lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX,
           });
         };
         const spawnAt = (gx, gy, vol, conc) =>
@@ -400,9 +438,8 @@
         const dropIndex = (d) => (d ? drops.indexOf(d) : -1);
 
         let prev = 0, raf = 0, dispClock = 0, elapsed = 0;
-        let wasPress = false, grabbed = null, pvx = 0, pvy = 0;
+        let lastDown = M.down, grabbed = null, pvx = 0, pvy = 0;
         let lastCX = M.x, lastCY = M.y;
-        const shocks = [];
         let alive = true;
 
         const loop = (now) => {
@@ -425,31 +462,32 @@
           pvy += (cvy - pvy) * 0.4;
           lastCX = M.x;
           lastCY = M.y;
-          const pressed = M.press && on;
-          if (pressed && !wasPress) {
+          // 1 when the cursor is still, 0 when sweeping fast — drives the darts
+          const stillness = on ? Math.max(0, 1 - Math.hypot(pvx, pvy) / STILL_REF) : 0;
+          // one-shot press, latched via M.down so a quick click (pointerdown +
+          // pointerup within one frame) is never missed: grab the nearest blob.
+          if (M.down !== lastDown) {
+            lastDown = M.down;
             let best = null;
             let bestD = GRAB_RADIUS * GRAB_RADIUS;
             for (let k = 0; k < drops.length; k++) {
               const d = drops[k];
-              const dd = (d.x - M.x) ** 2 + (d.y - M.y) ** 2;
+              const dd = (d.x - M.downX) ** 2 + (d.y - M.downY) ** 2;
               if (dd < bestD) { bestD = dd; best = d; }
             }
             if (best) grabbed = best;
-            else {
-              shocks.push({ x: M.x, y: M.y, t0: elapsed });
-              if (shocks.length > 6) shocks.shift();
-            }
           }
-          if (!pressed && wasPress && grabbed) {
-            const fv = Math.hypot(pvx, pvy);
-            const f = fv > FLING_MAX ? FLING_MAX / fv : 1;
-            grabbed.vx = pvx * f;
-            grabbed.vy = pvy * f;
+          // release → fling (also clears when the cursor leaves the window)
+          if (grabbed && !M.press) {
+            if (on) {
+              const fv = Math.hypot(pvx, pvy);
+              const f = fv > FLING_MAX ? FLING_MAX / fv : 1;
+              grabbed.vx = pvx * f;
+              grabbed.vy = pvy * f;
+            }
             grabbed = null;
           }
-          wasPress = pressed;
           if (grabbed && dropIndex(grabbed) < 0) grabbed = null;
-          while (shocks.length && elapsed - shocks[0].t0 > SHOCK_LIFE) shocks.shift();
 
           for (let i = 0; i < drops.length; i++) {
             const d = drops[i];
@@ -497,17 +535,42 @@
                 target = d.wander;
               } else if (!seeking && !reduceMotion) {
                 d.wander += (rnd() - 0.5) * WANDER_TURN * dt * 6;
-                const margin = baseR * 2;
-                if (d.x < margin) d.wander += (0 - d.wander) * dt;
-                else if (d.x > W - margin) d.wander += (Math.PI - d.wander) * dt;
-                if (d.y < margin) d.wander += (Math.PI / 2 - d.wander) * dt;
-                else if (d.y > H - margin) d.wander += (-Math.PI / 2 - d.wander) * dt;
+                // steer away from walls: build an inward push vector that grows
+                // toward each edge, then turn (shortest way) toward it — strongly
+                // enough to win over the random walk, even pinned in a corner.
+                const margin = baseR * 3;
+                let pushX = 0, pushY = 0;
+                if (d.x < margin) pushX += 1 - d.x / margin;
+                else if (d.x > W - margin) pushX -= 1 - (W - d.x) / margin;
+                if (d.y < margin) pushY += 1 - d.y / margin;
+                else if (d.y > H - margin) pushY -= 1 - (H - d.y) / margin;
+                if (pushX !== 0 || pushY !== 0) {
+                  const away = Math.atan2(pushY, pushX);
+                  let diff = away - d.wander;
+                  diff = Math.atan2(Math.sin(diff), Math.cos(diff)); // → [-π, π]
+                  const near = Math.min(1, Math.hypot(pushX, pushY));
+                  d.wander += diff * Math.min(1, dt * 7 * (0.4 + near));
+                }
                 target = d.wander;
               }
               const ke = reduceMotion ? 1 : Math.min(1, dt * HEAD_EASE);
               const hx = Math.cos(d.head) + (Math.cos(target) - Math.cos(d.head)) * ke;
               const hy = Math.sin(d.head) + (Math.sin(target) - Math.sin(d.head)) * ke;
               d.head = Math.atan2(hy, hx);
+            }
+
+            // stalk-and-dart: build up between lunges, dart in bursts —
+            // darts fire more often the stiller the cursor is held
+            if (d.chasing) {
+              if (d.lunge > 0) d.lunge = Math.max(0, d.lunge - dt / LUNGE_TIME);
+              d.lungeCd -= dt * (0.5 + stillness * 1.6);
+              if (d.lungeCd <= 0) {
+                d.lunge = 1;
+                d.lungeCd = LUNGE_GAP_MIN + rnd() * (LUNGE_GAP_MAX - LUNGE_GAP_MIN);
+              }
+            } else {
+              d.lunge = 0;
+              d.lungeCd = LUNGE_GAP_MIN;
             }
 
             const ux = Math.cos(d.head);
@@ -561,27 +624,17 @@
                 d.vol -= xfer;
                 d.volTarget = d.vol;
               } else {
-                const pull = (d.chasing ? CHASE_PULL : (on ? IDLE_PULL : WANDER_PULL)) * d.vigor;
+                const chaseThrust = STALK_CREEP + LUNGE_BOOST * d.lunge * (0.35 + 0.65 * stillness);
+                const pull = (d.chasing ? CHASE_PULL * chaseThrust : (on ? IDLE_PULL : WANDER_PULL)) * d.vigor;
                 const norm = REF_R / Math.max(baseR, 1);
                 d.vx += fx * pull * norm * dt;
                 d.vy += fy * pull * norm * dt;
-                for (let s = 0; s < shocks.length; s++) {
-                  const sh = shocks[s];
-                  const sdx = d.x - sh.x;
-                  const sdy = d.y - sh.y;
-                  const sd = Math.hypot(sdx, sdy);
-                  if (sd < SHOCK_RADIUS && sd > 0.001) {
-                    const str = (1 - sd / SHOCK_RADIUS) * Math.exp(-(elapsed - sh.t0) * SHOCK_DECAY);
-                    d.vx += (sdx / sd) * str * SHOCK_FORCE * dt;
-                    d.vy += (sdy / sd) * str * SHOCK_FORCE * dt;
-                  }
-                }
                 const damp = Math.exp(-dt * BODY_DAMP);
                 d.vx *= damp;
                 d.vy *= damp;
               }
               const v = Math.hypot(d.vx, d.vy);
-              const cap = panic ? FLING_MAX : MAX_SPEED;
+              const cap = panic ? FLING_MAX : MAX_SPEED * d.paceMul;
               if (v > cap) {
                 d.vx *= cap / v;
                 d.vy *= cap / v;
@@ -622,8 +675,8 @@
               const cY = (g) => Math.max(0, Math.min(rows - 1, g));
               drops.splice(i, 1);
               drops.push(
-                { x: d.x, y: d.y, vx: d.ax * 60, vy: d.ay * 60, cgx: cX(d.cgx + sx), cgy: cY(d.cgy + sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(d.ay, d.ax), head: Math.atan2(d.ay, d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, chasing: d.chasing, entering: false, absorbedBy: null, limbs: mkLimbs(d.x, d.y) },
-                { x: d.x, y: d.y, vx: -d.ax * 60, vy: -d.ay * 60, cgx: cX(d.cgx - sx), cgy: cY(d.cgy - sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(-d.ay, -d.ax), head: Math.atan2(-d.ay, -d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, chasing: d.chasing, entering: false, absorbedBy: null, limbs: mkLimbs(d.x, d.y) },
+                { x: d.x, y: d.y, vx: d.ax * 60, vy: d.ay * 60, cgx: cX(d.cgx + sx), cgy: cY(d.cgy + sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(d.ay, d.ax), head: Math.atan2(d.ay, d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9, chasing: d.chasing, entering: false, absorbedBy: null, lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX, limbs: mkLimbs(d.x, d.y) },
+                { x: d.x, y: d.y, vx: -d.ax * 60, vy: -d.ay * 60, cgx: cX(d.cgx - sx), cgy: cY(d.cgy - sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(-d.ay, -d.ax), head: Math.atan2(-d.ay, -d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, paceMul: 0.55 + rnd() * 0.9, chasing: d.chasing, entering: false, absorbedBy: null, lunge: 0, lungeCd: rnd() * LUNGE_GAP_MAX, limbs: mkLimbs(d.x, d.y) },
               );
             }
           }
@@ -711,6 +764,33 @@
         clearTimeout(resizeT);
         resizeT = setTimeout(start, 200);
       });
+
+      // ── custom blob cursor: trails the pointer, squishes with speed ──────
+      const blob = document.getElementById("blob");
+      let bx = M.x, by = M.y, bpx = bx, bpy = by;
+      const blobLoop = () => {
+        const on = M.active && M.x > -9000;
+        blob.style.opacity = on ? "1" : "0";
+        if (on) {
+          // ease toward the pointer for a soft trailing lag
+          bx += (M.x - bx) * 0.32;
+          by += (M.y - by) * 0.32;
+          const vx = bx - bpx;
+          const vy = by - bpy;
+          bpx = bx;
+          bpy = by;
+          const sp = Math.hypot(vx, vy);
+          // stretch along travel direction, contract on press
+          const stretch = Math.min(0.9, sp * 0.05);
+          const ang = (Math.atan2(vy, vx) * 180) / Math.PI;
+          const scale = M.press ? 0.6 : 1;
+          blob.style.transform =
+            `translate(${bx}px, ${by}px) rotate(${ang}deg) ` +
+            `scale(${scale * (1 + stretch)}, ${scale * (1 - stretch * 0.6)})`;
+        }
+        requestAnimationFrame(blobLoop);
+      };
+      requestAnimationFrame(blobLoop);
     </script>
   </body>
 </html>
