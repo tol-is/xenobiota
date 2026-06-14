@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Critters</title>
+    <style>
+      @font-face {
+        font-family: "NeueBit";
+        src: url("./fonts/NeueBit-Regular.woff2") format("woff2");
+        font-weight: 400;
+        font-style: normal;
+        font-display: block;
+      }
+      @font-face {
+        font-family: "NeueBit";
+        src: url("./fonts/NeueBit-Bold.woff2") format("woff2");
+        font-weight: 700;
+        font-style: normal;
+        font-display: block;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #eaeaea;
+        overflow: hidden;
+        touch-action: none;
+        overscroll-behavior: none;
+        font-family: "NeueBit", monospace;
+      }
+      #c {
+        position: fixed;
+        inset: 0;
+        display: block;
+      }
+      /* credit link — sits above the canvas, bottom-right */
+      #credit {
+        position: fixed;
+        right: 16px;
+        bottom: 14px;
+        z-index: 2;
+        font-family: "NeueBit", monospace;
+        font-size: 15px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: oklch(0.25 0 0);
+        text-decoration: none;
+        opacity: 0.55;
+        transition: opacity 0.2s ease;
+        mix-blend-mode: multiply;
+      }
+      #credit:hover {
+        opacity: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <a id="credit" href="https://tol.is" target="_blank" rel="noopener" onpointerdown="event.stopPropagation()">tol.is</a>
+    <script>
+      // a metaball-SDF colony of black goo creatures
+      // that crawl on tendril-limbs, hunt the cursor, coalesce and scatter.
+
+      // ── droplet shape ──────────────────────────────────────────────────
+      const BASE_R = 0.46;
+      const STRETCH_GAIN = 0.011;
+      const STRETCH_RELAX = 6;
+
+      // ── coalescence / division ─────────────────────────────────────────
+      const MERGE_OVERLAP = 0.74;
+      const SPLIT_VOL = 3.0;
+      const SPLIT_STRETCH = 1.2; // above the stretch cap → speed-driven split off
+      const SPLIT_COOLDOWN = 0.5;
+
+      // ── dispensing ─────────────────────────────────────────────────────
+      const TARGET_COUNT = 8;
+      const MAX_DROPS = 18;
+      const DISPENSE_EVERY = 2.2;
+
+      // ── octopus locomotion ─────────────────────────────────────────────
+      const K_LIMB = 5;
+      const MAX_SEG = MAX_DROPS * K_LIMB;
+      const LIMB_CYCLE = 1.6;
+      const LIMB_REACH_FRAC = 0.4;
+      const LIMB_REACH = 2;
+      const LIMB_SWING = 11;
+      const CHASE_PULL = 10.5;
+      const IDLE_PULL = 1.8;
+      const WANDER_PULL = 5.5; // mouse off-viewport → roam more energetically
+      const CHASE_GAIT = 2.1;
+      const BODY_DAMP = 4.6;
+      const REF_R = 36;
+      const MAX_SPEED = 520;
+      const MERGE_GROW = 3.2;
+      const MAX_VOL = 4;
+      const ABSORB_PULL = 13;
+      const ABSORB_DAMP = 7;
+      const ABSORB_SPEED = 3.5;
+
+      // ── direct interaction ─────────────────────────────────────────────
+      const GRAB_RADIUS = 110;
+      const GRAB_SPRING = 90;
+      const GRAB_DAMP = 9;
+      const PANIC_SPIN = 9;
+      const FLING_MAX = 1500;
+      const SHOCK_RADIUS = 340;
+      const SHOCK_FORCE = 1400;
+      const SHOCK_DECAY = 3.2;
+      const SHOCK_LIFE = 1.1;
+      const MIN_LIMB = 0.95;
+      const HEAD_EASE = 3.6;
+      const WAKE_RADIUS = 400;
+      const LOSE_RADIUS = 760;
+      const WANDER_TURN = 2;
+      const BREATHE = 0.27;
+
+      const hash = (n) => {
+        const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+        return s - Math.floor(s);
+      };
+
+      const VERT = `attribute vec2 a; void main(){ gl_Position = vec4(a, 0.0, 1.0); }`;
+
+      const FRAG = `precision highp float;
+      #define MAXD ${MAX_DROPS}
+      #define MAXSEG ${MAX_SEG}
+      uniform vec2 uRes;
+      uniform float uPitch;
+      uniform float uDpr;
+      uniform float uTime;
+      uniform vec4 uDrops[MAXD];
+      uniform int uCount;
+      uniform vec4 uSeg[MAXSEG];
+      uniform float uSegR[MAXSEG];
+      uniform int uSegN;
+      uniform vec3 uBg;
+      uniform vec3 uHi;
+      uniform float uGlow;
+
+      float kBlend;
+
+      float smin(float a, float b, float k){
+        float h = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
+        return mix(a, b, h) - k * h * (1.0 - h);
+      }
+      float n2(vec2 p){
+        return sin(p.x * 1.7 + p.y * 2.3) * sin(p.x * 2.9 - p.y * 1.3 + 1.1);
+      }
+      float sdLimb(vec2 p, vec2 a, vec2 b, float rb){
+        vec2 pa = p - a;
+        vec2 ba = b - a;
+        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0), 0.0, 1.0);
+        return length(pa - ba * h) - mix(rb, 1.5 * uDpr, h);
+      }
+      float field(vec2 p){
+        vec2 w = vec2(
+          n2(p * 0.0026 + vec2(uTime * 0.5, 0.0)),
+          n2(p * 0.0026 + vec2(0.0, uTime * 0.44 + 9.0))
+        );
+        p += w * (uPitch * 0.07);
+        float d = 1e9;
+        for(int i = 0; i < MAXD; i++){
+          if(i >= uCount) break;
+          vec4 dr = uDrops[i];
+          d = smin(d, length(p - dr.xy) - dr.z, kBlend);
+        }
+        float kLimb = uPitch * 0.32;
+        for(int i = 0; i < MAXSEG; i++){
+          if(i >= uSegN) break;
+          vec4 s = uSeg[i];
+          d = smin(d, sdLimb(p, s.xy, s.zw, uSegR[i]), kLimb);
+        }
+        return d;
+      }
+      void main(){
+        vec2 p = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
+        kBlend = uPitch * 0.7;
+        vec2 uv = p / uRes;
+        float vig = smoothstep(1.15, 0.25, length(uv - 0.5));
+        vec3 col = mix(uBg * 0.35, uBg, vig);
+        float d = field(p);
+        if(d > 0.0){
+          col = mix(col, vec3(0.0), exp(-d / (uPitch * 0.6)) * 0.55);
+        }
+        if(d < 1.5 * uDpr){
+          float e = 1.5 * uDpr;
+          float dx = field(p + vec2(e, 0.0)) - field(p - vec2(e, 0.0));
+          float dy = field(p + vec2(0.0, e)) - field(p - vec2(0.0, e));
+          vec2 gd = vec2(dx, dy) / (2.0 * e);
+          float clean = smoothstep(0.32, 0.82, length(gd));
+          float beadH = uPitch * 0.3;
+          float t = clamp(-d / beadH, 0.0, 1.0);
+          vec3 nrm = normalize(vec3(gd * (1.0 - t) * 1.8, t * 0.8 + 0.1));
+          vec3 L1 = normalize(vec3(-0.5, 0.7, 0.55));
+          vec3 L2 = normalize(vec3(0.62, -0.32, 0.5));
+          float spec1 = pow(max(dot(reflect(-L1, nrm), vec3(0.0, 0.0, 1.0)), 0.0), 38.0);
+          float spec2 = pow(max(dot(reflect(-L2, nrm), vec3(0.0, 0.0, 1.0)), 0.0), 80.0);
+          float fres = pow(1.0 - t, 3.0);
+          float shell = smoothstep(0.0, 0.5, 1.0 - t);
+          vec3 body = vec3(0.0);
+          body += uHi * fres * 1.2 * uGlow * clean;
+          body += vec3(1.0) * (spec1 * 1.9 + spec2 * 1.6) * uGlow * shell * clean;
+          float cov = smoothstep(1.0 * uDpr, -1.0 * uDpr, d);
+          col = mix(col, body, cov);
+        }
+        gl_FragColor = vec4(col, 1.0);
+      }`;
+
+      function compile(gl, type, src) {
+        const sh = gl.createShader(type);
+        gl.shaderSource(sh, src);
+        gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+          console.error("shader:", gl.getShaderInfoLog(sh));
+        }
+        return sh;
+      }
+
+      // ── light-theme colours, resolved to sRGB via a 1×1 canvas ──────────
+      const cc = document.createElement("canvas");
+      cc.width = cc.height = 1;
+      const cctx = cc.getContext("2d", { willReadFrequently: true });
+      function resolveColor(str, fallback) {
+        try {
+          cctx.fillStyle = "#000";
+          cctx.fillStyle = str;
+          cctx.fillRect(0, 0, 1, 1);
+          const d = cctx.getImageData(0, 0, 1, 1).data;
+          return [d[0] / 255, d[1] / 255, d[2] / 255];
+        } catch (e) {
+          return fallback;
+        }
+      }
+      const BG = resolveColor("#eaeaea", [0.918, 0.918, 0.918]);
+      const HI = resolveColor("oklch(0.25 0 0)", [0.18, 0.18, 0.18]);
+      const GLOW = 0.299 * BG[0] + 0.587 * BG[1] + 0.114 * BG[2] < 0.5 ? 0.45 : 1.0;
+
+      // ── global pointer state (attached once) ────────────────────────────
+      const M = { x: -9999, y: -9999, active: false, press: false };
+      addEventListener("mousemove", (e) => {
+        M.x = e.clientX;
+        M.y = e.clientY;
+        M.active = true;
+      });
+      const leave = () => {
+        M.active = false;
+        M.press = false;
+        M.x = -9999;
+        M.y = -9999;
+      };
+      // window "mouseleave" is unreliable; detect the cursor actually exiting
+      // the document via mouseout with no related target, plus a few fallbacks.
+      document.addEventListener("mouseout", (e) => {
+        if (!e.relatedTarget && !e.toElement) leave();
+      });
+      document.addEventListener("mouseleave", leave);
+      addEventListener("blur", leave);
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) leave();
+      });
+      addEventListener("pointerdown", (e) => {
+        M.x = e.clientX;
+        M.y = e.clientY;
+        M.active = true;
+        M.press = true;
+      });
+      addEventListener("pointerup", () => {
+        M.press = false;
+      });
+      addEventListener("touchmove", (e) => {
+        const t = e.touches[0];
+        if (!t) return;
+        M.x = t.clientX;
+        M.y = t.clientY;
+        M.active = true;
+      }, { passive: true });
+      addEventListener("touchstart", (e) => {
+        const t = e.touches[0];
+        if (!t) return;
+        M.x = t.clientX;
+        M.y = t.clientY;
+        M.active = true;
+        M.press = true;
+      }, { passive: true });
+      addEventListener("touchend", () => {
+        M.active = false;
+        M.press = false;
+      });
+
+      const canvas = document.getElementById("c");
+      const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      let teardown = null;
+
+      function start() {
+        if (teardown) teardown();
+
+        const W = window.innerWidth;
+        const H = window.innerHeight;
+        const gl = canvas.getContext("webgl", { alpha: false, antialias: false });
+        if (!gl) return;
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.floor(W * dpr);
+        canvas.height = Math.floor(H * dpr);
+        canvas.style.width = W + "px";
+        canvas.style.height = H + "px";
+        gl.viewport(0, 0, canvas.width, canvas.height);
+
+        const prog = gl.createProgram();
+        gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
+        gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG));
+        gl.linkProgram(prog);
+        gl.useProgram(prog);
+
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        const aLoc = gl.getAttribLocation(prog, "a");
+        gl.enableVertexAttribArray(aLoc);
+        gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+
+        const u = (name) => gl.getUniformLocation(prog, name);
+        const uRes = u("uRes");
+        const uPitch = u("uPitch");
+        const uDpr = u("uDpr");
+        const uTime = u("uTime");
+        const uDrops = u("uDrops");
+        const uCount = u("uCount");
+        const uSeg = u("uSeg");
+        const uSegR = u("uSegR");
+        const uSegN = u("uSegN");
+        const uBg = u("uBg");
+        const uHi = u("uHi");
+        const uGlow = u("uGlow");
+
+        const pitch = Math.max(54, Math.min(104, Math.round(Math.min(W, H) / 11)));
+        const cols = Math.max(4, Math.floor((W - pitch * 0.5) / pitch));
+        const rows = Math.max(4, Math.floor((H - pitch * 0.5) / pitch));
+        const ox = (W - cols * pitch) / 2;
+        const oy = (H - rows * pitch) / 2;
+        const cellCx = (gx) => ox + (gx + 0.5) * pitch;
+        const cellCy = (gy) => oy + (gy + 0.5) * pitch;
+        const rOf = (vol) => BASE_R * pitch * Math.sqrt(vol);
+
+        gl.uniform2f(uRes, canvas.width, canvas.height);
+        gl.uniform1f(uPitch, pitch * dpr);
+        gl.uniform1f(uDpr, dpr);
+        gl.uniform3f(uBg, BG[0], BG[1], BG[2]);
+        gl.uniform3f(uHi, HI[0], HI[1], HI[2]);
+        gl.uniform1f(uGlow, GLOW);
+
+        let seed = 7.3;
+        const rnd = () => hash((seed += 0.61803));
+        const drops = [];
+        const mkLimbs = (x, y) => {
+          const ls = [];
+          for (let l = 0; l < K_LIMB; l++) {
+            ls.push({ ax: x, ay: y, tax: x, tay: y, base: (l / K_LIMB) * Math.PI * 2 + rnd(), floorPh: -1, grip: false, ph: rnd(), rm: 0.82 + rnd() * 0.36 });
+          }
+          return ls;
+        };
+        const addDrop = (x, y, vol, conc, head, entering) => {
+          if (drops.length >= MAX_DROPS) return;
+          drops.push({
+            x, y, vx: 0, vy: 0,
+            cgx: Math.max(0, Math.min(cols - 1, Math.round((x - ox) / pitch - 0.5))),
+            cgy: Math.max(0, Math.min(rows - 1, Math.round((y - oy) / pitch - 0.5))),
+            vol, volTarget: vol, conc, stretch: 0,
+            ax: Math.cos(head), ay: Math.sin(head), cool: 0,
+            phase: rnd() * 6.28, wander: head, head,
+            vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8,
+            chasing: false, entering, absorbedBy: null, limbs: mkLimbs(x, y),
+          });
+        };
+        const spawnAt = (gx, gy, vol, conc) =>
+          addDrop(cellCx(gx), cellCy(gy), vol, conc, rnd() * 6.28, false);
+        const enterFromEdge = (vol, conc) => {
+          const m = 70;
+          const e = Math.floor(rnd() * 4);
+          if (e === 0) addDrop(-m, rnd() * H, vol, conc, 0, true);
+          else if (e === 1) addDrop(W + m, rnd() * H, vol, conc, Math.PI, true);
+          else if (e === 2) addDrop(rnd() * W, -m, vol, conc, Math.PI / 2, true);
+          else addDrop(rnd() * W, H + m, vol, conc, -Math.PI / 2, true);
+        };
+        for (let i = 0; i < TARGET_COUNT; i++) {
+          spawnAt(2 + Math.floor(rnd() * (cols - 3)), Math.floor(rnd() * rows), 0.8 + rnd() * 0.8, rnd() < 0.5 ? 0.2 : 0.85);
+        }
+        const resConc = [0.18, 0.86];
+        let resIdx = 0;
+        const dispense = () => {
+          const k = resIdx % 2;
+          resIdx++;
+          enterFromEdge(0.7 + rnd() * 0.3, resConc[k]);
+        };
+
+        const dropBuf = new Float32Array(MAX_DROPS * 4);
+        const segBuf = new Float32Array(MAX_SEG * 4);
+        const segR = new Float32Array(MAX_SEG);
+        const dropIndex = (d) => (d ? drops.indexOf(d) : -1);
+
+        let prev = 0, raf = 0, dispClock = 0, elapsed = 0;
+        let wasPress = false, grabbed = null, pvx = 0, pvy = 0;
+        let lastCX = M.x, lastCY = M.y;
+        const shocks = [];
+        let alive = true;
+
+        const loop = (now) => {
+          if (!alive) return;
+          const dt = Math.min((now - prev) / 1000, 0.05);
+          prev = now;
+          if (!reduceMotion) elapsed += dt;
+
+          const on = M.active && M.x > -9000;
+
+          dispClock += dt;
+          if (dispClock >= DISPENSE_EVERY) {
+            dispClock = 0;
+            if (drops.length < TARGET_COUNT) dispense();
+          }
+
+          const cvx = (M.x - lastCX) / Math.max(dt, 1e-3);
+          const cvy = (M.y - lastCY) / Math.max(dt, 1e-3);
+          pvx += (cvx - pvx) * 0.4;
+          pvy += (cvy - pvy) * 0.4;
+          lastCX = M.x;
+          lastCY = M.y;
+          const pressed = M.press && on;
+          if (pressed && !wasPress) {
+            let best = null;
+            let bestD = GRAB_RADIUS * GRAB_RADIUS;
+            for (let k = 0; k < drops.length; k++) {
+              const d = drops[k];
+              const dd = (d.x - M.x) ** 2 + (d.y - M.y) ** 2;
+              if (dd < bestD) { bestD = dd; best = d; }
+            }
+            if (best) grabbed = best;
+            else {
+              shocks.push({ x: M.x, y: M.y, t0: elapsed });
+              if (shocks.length > 6) shocks.shift();
+            }
+          }
+          if (!pressed && wasPress && grabbed) {
+            const fv = Math.hypot(pvx, pvy);
+            const f = fv > FLING_MAX ? FLING_MAX / fv : 1;
+            grabbed.vx = pvx * f;
+            grabbed.vy = pvy * f;
+            grabbed = null;
+          }
+          wasPress = pressed;
+          if (grabbed && dropIndex(grabbed) < 0) grabbed = null;
+          while (shocks.length && elapsed - shocks[0].t0 > SHOCK_LIFE) shocks.shift();
+
+          for (let i = 0; i < drops.length; i++) {
+            const d = drops[i];
+            if (d.cool > 0) d.cool -= dt;
+            if (d.vol !== d.volTarget) {
+              d.vol += (d.volTarget - d.vol) * Math.min(1, dt * MERGE_GROW);
+              if (Math.abs(d.volTarget - d.vol) < 0.01) d.vol = d.volTarget;
+            }
+            const baseR = rOf(d.vol);
+            const panic = d === grabbed;
+            const pred = d.absorbedBy && dropIndex(d.absorbedBy) >= 0 ? d.absorbedBy : null;
+            const absorbing = pred !== null && !panic;
+
+            let target = d.wander;
+            let seeking = false;
+            if (panic) {
+              d.head += PANIC_SPIN * dt;
+              d.chasing = false;
+              d.cool = Math.max(d.cool, 0.15);
+            } else if (absorbing && pred) {
+              d.chasing = false;
+              const a = Math.atan2(pred.y - d.y, pred.x - d.x);
+              const ke = Math.min(1, dt * HEAD_EASE);
+              const hx = Math.cos(d.head) + (Math.cos(a) - Math.cos(d.head)) * ke;
+              const hy = Math.sin(d.head) + (Math.sin(a) - Math.sin(d.head)) * ke;
+              d.head = Math.atan2(hy, hx);
+            } else {
+              if (on) {
+                const dxc = M.x - d.x;
+                const dyc = M.y - d.y;
+                const dist = Math.hypot(dxc, dyc);
+                if (d.chasing) {
+                  if (dist > LOSE_RADIUS) d.chasing = false;
+                } else if (dist < WAKE_RADIUS) {
+                  d.chasing = true;
+                }
+                if (d.chasing && dist > baseR * 0.7) {
+                  target = Math.atan2(dyc, dxc) + 0.55 * Math.sin(elapsed * 0.8 + d.phase);
+                  seeking = true;
+                }
+              } else {
+                d.chasing = false;
+              }
+              if (!seeking && d.entering) {
+                target = d.wander;
+              } else if (!seeking && !reduceMotion) {
+                d.wander += (rnd() - 0.5) * WANDER_TURN * dt * 6;
+                const margin = baseR * 2;
+                if (d.x < margin) d.wander += (0 - d.wander) * dt;
+                else if (d.x > W - margin) d.wander += (Math.PI - d.wander) * dt;
+                if (d.y < margin) d.wander += (Math.PI / 2 - d.wander) * dt;
+                else if (d.y > H - margin) d.wander += (-Math.PI / 2 - d.wander) * dt;
+                target = d.wander;
+              }
+              const ke = reduceMotion ? 1 : Math.min(1, dt * HEAD_EASE);
+              const hx = Math.cos(d.head) + (Math.cos(target) - Math.cos(d.head)) * ke;
+              const hy = Math.sin(d.head) + (Math.sin(target) - Math.sin(d.head)) * ke;
+              d.head = Math.atan2(hy, hx);
+            }
+
+            const ux = Math.cos(d.head);
+            const uy = Math.sin(d.head);
+            let thrust = 0;
+            for (let l = 0; l < K_LIMB; l++) {
+              const lm = d.limbs[l];
+              const rate = d.gaitRate * (d.chasing ? CHASE_GAIT : 1) * lm.rm;
+              const ph = (elapsed * rate) / LIMB_CYCLE + lm.ph;
+              const fl = Math.floor(ph);
+              const cyc = ph - fl;
+              if (lm.floorPh !== fl) {
+                lm.floorPh = fl;
+                lm.grip = false;
+                const a = d.head + (l - (K_LIMB - 1) / 2) * 0.62 + (rnd() - 0.5) * 0.14;
+                const reach = baseR * LIMB_REACH * (0.85 + 0.3 * rnd());
+                lm.tax = d.x + Math.cos(a) * reach;
+                lm.tay = d.y + Math.sin(a) * reach;
+              }
+              if (cyc < LIMB_REACH_FRAC && !lm.grip) {
+                const sw = reduceMotion ? 1 : Math.min(1, dt * LIMB_SWING);
+                lm.ax += (lm.tax - lm.ax) * sw;
+                lm.ay += (lm.tay - lm.ay) * sw;
+              } else {
+                lm.grip = true;
+                const fwd = (lm.ax - d.x) * ux + (lm.ay - d.y) * uy;
+                if (fwd > 0) thrust += fwd;
+              }
+            }
+            const fx = ux * thrust;
+            const fy = uy * thrust;
+
+            if (!reduceMotion) {
+              if (panic) {
+                d.vx += (M.x - d.x) * GRAB_SPRING * dt;
+                d.vy += (M.y - d.y) * GRAB_SPRING * dt;
+                const gdamp = Math.exp(-dt * GRAB_DAMP);
+                d.vx *= gdamp;
+                d.vy *= gdamp;
+              } else if (absorbing && pred) {
+                d.vx += (pred.x - d.x) * ABSORB_PULL * dt;
+                d.vy += (pred.y - d.y) * ABSORB_PULL * dt;
+                const adamp = Math.exp(-dt * ABSORB_DAMP);
+                d.vx *= adamp;
+                d.vy *= adamp;
+                const xfer = Math.min(d.vol, d.vol * Math.min(1, dt * ABSORB_SPEED) + 0.02);
+                const pv = pred.vol + xfer;
+                pred.conc = (pred.conc * pred.vol + d.conc * xfer) / pv;
+                pred.vol = Math.min(MAX_VOL, pv);
+                pred.volTarget = pred.vol;
+                d.vol -= xfer;
+                d.volTarget = d.vol;
+              } else {
+                const pull = (d.chasing ? CHASE_PULL : (on ? IDLE_PULL : WANDER_PULL)) * d.vigor;
+                const norm = REF_R / Math.max(baseR, 1);
+                d.vx += fx * pull * norm * dt;
+                d.vy += fy * pull * norm * dt;
+                for (let s = 0; s < shocks.length; s++) {
+                  const sh = shocks[s];
+                  const sdx = d.x - sh.x;
+                  const sdy = d.y - sh.y;
+                  const sd = Math.hypot(sdx, sdy);
+                  if (sd < SHOCK_RADIUS && sd > 0.001) {
+                    const str = (1 - sd / SHOCK_RADIUS) * Math.exp(-(elapsed - sh.t0) * SHOCK_DECAY);
+                    d.vx += (sdx / sd) * str * SHOCK_FORCE * dt;
+                    d.vy += (sdy / sd) * str * SHOCK_FORCE * dt;
+                  }
+                }
+                const damp = Math.exp(-dt * BODY_DAMP);
+                d.vx *= damp;
+                d.vy *= damp;
+              }
+              const v = Math.hypot(d.vx, d.vy);
+              const cap = panic ? FLING_MAX : MAX_SPEED;
+              if (v > cap) {
+                d.vx *= cap / v;
+                d.vy *= cap / v;
+              }
+              d.x += d.vx * dt;
+              d.y += d.vy * dt;
+              if (d.entering) {
+                if (d.x > baseR && d.x < W - baseR && d.y > baseR && d.y < H - baseR) {
+                  d.entering = false;
+                }
+              } else {
+                d.x = Math.max(baseR, Math.min(W - baseR, d.x));
+                d.y = Math.max(baseR, Math.min(H - baseR, d.y));
+              }
+            }
+
+            const sp = Math.hypot(d.vx, d.vy);
+            d.stretch += (Math.min(0.9, sp * STRETCH_GAIN) - d.stretch) * Math.min(1, dt * STRETCH_RELAX);
+            if (sp > 1) { d.ax = d.vx / sp; d.ay = d.vy / sp; }
+            d.cgx = Math.max(0, Math.min(cols - 1, Math.round((d.x - ox) / pitch - 0.5)));
+            d.cgy = Math.max(0, Math.min(rows - 1, Math.round((d.y - oy) / pitch - 0.5)));
+          }
+
+          for (let i = drops.length - 1; i >= 0; i--) {
+            const d = drops[i];
+            if (!d.absorbedBy) continue;
+            if (dropIndex(d.absorbedBy) < 0) d.absorbedBy = null;
+            else if (d.vol <= 0.05) drops.splice(i, 1);
+          }
+
+          for (let i = drops.length - 1; i >= 0; i--) {
+            const d = drops[i];
+            if (d.vol >= SPLIT_VOL && d.stretch >= SPLIT_STRETCH && d.cool <= 0) {
+              const half = d.vol / 2;
+              const sx = Math.abs(d.ax) >= Math.abs(d.ay) ? Math.sign(d.ax) || 1 : 0;
+              const sy = sx === 0 ? Math.sign(d.ay) || 1 : 0;
+              const cX = (g) => Math.max(0, Math.min(cols - 1, g));
+              const cY = (g) => Math.max(0, Math.min(rows - 1, g));
+              drops.splice(i, 1);
+              drops.push(
+                { x: d.x, y: d.y, vx: d.ax * 60, vy: d.ay * 60, cgx: cX(d.cgx + sx), cgy: cY(d.cgy + sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(d.ay, d.ax), head: Math.atan2(d.ay, d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, chasing: d.chasing, entering: false, absorbedBy: null, limbs: mkLimbs(d.x, d.y) },
+                { x: d.x, y: d.y, vx: -d.ax * 60, vy: -d.ay * 60, cgx: cX(d.cgx - sx), cgy: cY(d.cgy - sy), vol: half, volTarget: half, conc: d.conc, stretch: 0, ax: d.ax, ay: d.ay, cool: SPLIT_COOLDOWN, phase: rnd() * 6.28, wander: Math.atan2(-d.ay, -d.ax), head: Math.atan2(-d.ay, -d.ax), vigor: 0.6 + rnd() * 0.85, gaitRate: 0.7 + rnd() * 0.8, chasing: d.chasing, entering: false, absorbedBy: null, limbs: mkLimbs(d.x, d.y) },
+              );
+            }
+          }
+
+          for (let i = 0; i < drops.length; i++) {
+            for (let j = i + 1; j < drops.length; j++) {
+              const a = drops[i];
+              const b = drops[j];
+              if (a.cool > 0 || b.cool > 0) continue;
+              if (a.absorbedBy || b.absorbedBy) continue;
+              const rr = (rOf(a.vol) + rOf(b.vol)) * MERGE_OVERLAP;
+              const dx = a.x - b.x;
+              const dy = a.y - b.y;
+              if (dx * dx + dy * dy < rr * rr) {
+                const predator = a.vol >= b.vol ? a : b;
+                const prey = predator === a ? b : a;
+                prey.absorbedBy = predator;
+                prey.chasing = false;
+              }
+            }
+          }
+
+          let segN = 0;
+          for (let i = 0; i < drops.length; i++) {
+            const d = drops[i];
+            const r = rOf(d.vol) * (1 + BREATHE * Math.sin(elapsed * 1.3 + d.phase));
+            const o = i * 4;
+            dropBuf[o] = d.x * dpr;
+            dropBuf[o + 1] = d.y * dpr;
+            dropBuf[o + 2] = r * dpr;
+            dropBuf[o + 3] = d.conc;
+            const minLen = r * MIN_LIMB;
+            for (let l = 0; l < K_LIMB && segN < MAX_SEG; l++) {
+              const lm = d.limbs[l];
+              let tx = lm.ax;
+              let ty = lm.ay;
+              const dxl = tx - d.x;
+              const dyl = ty - d.y;
+              const len = Math.hypot(dxl, dyl);
+              if (len < minLen) {
+                if (len > 0.001) {
+                  tx = d.x + (dxl / len) * minLen;
+                  ty = d.y + (dyl / len) * minLen;
+                } else {
+                  tx = d.x + Math.cos(d.head) * minLen;
+                  ty = d.y + Math.sin(d.head) * minLen;
+                }
+              }
+              const so = segN * 4;
+              segBuf[so] = d.x * dpr;
+              segBuf[so + 1] = d.y * dpr;
+              segBuf[so + 2] = tx * dpr;
+              segBuf[so + 3] = ty * dpr;
+              segR[segN] = r * 0.5 * dpr;
+              segN++;
+            }
+          }
+          gl.uniform4fv(uDrops, dropBuf);
+          gl.uniform1i(uCount, drops.length);
+          gl.uniform4fv(uSeg, segBuf);
+          gl.uniform1fv(uSegR, segR);
+          gl.uniform1i(uSegN, segN);
+          gl.uniform1f(uTime, elapsed);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+          raf = requestAnimationFrame(loop);
+        };
+
+        raf = requestAnimationFrame((t0) => {
+          prev = t0;
+          raf = requestAnimationFrame(loop);
+        });
+
+        teardown = () => {
+          alive = false;
+          cancelAnimationFrame(raf);
+          gl.deleteProgram(prog);
+          gl.deleteBuffer(buf);
+        };
+      }
+
+      start();
+      let resizeT;
+      addEventListener("resize", () => {
+        clearTimeout(resizeT);
+        resizeT = setTimeout(start, 200);
+      });
+    </script>
+  </body>
+</html>
