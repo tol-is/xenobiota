@@ -478,8 +478,36 @@
           else if (e === 2) addDrop(rnd() * W, -m, vol, conc, Math.PI / 2, true);
           else addDrop(rnd() * W, H + m, vol, conc, -Math.PI / 2, true);
         };
+        // scene open: the colony crawls in from the edges, converging on the
+        // central area — a chunk of them scurrying in fast, the rest creeping.
+        const enterTowardCenter = (vol, conc, fast) => {
+          const m = 80;
+          const e = Math.floor(rnd() * 4);
+          let x, y;
+          if (e === 0) { x = -m; y = rnd() * H; }
+          else if (e === 1) { x = W + m; y = rnd() * H; }
+          else if (e === 2) { x = rnd() * W; y = -m; }
+          else { x = rnd() * W; y = H + m; }
+          // aim at a scattered point around mid-screen so they don't all pile up
+          const tx = W * (0.35 + rnd() * 0.3);
+          const ty = H * (0.35 + rnd() * 0.3);
+          const head = Math.atan2(ty - y, tx - x);
+          const before = drops.length;
+          addDrop(x, y, vol, conc, head, true);
+          if (drops.length === before) return;
+          const d = drops[drops.length - 1];
+          d.wander = head;
+          if (fast) {
+            d.vigor = 1.4 + rnd() * 0.7;
+            d.paceMul = 1.1 + rnd() * 0.5;
+            d.gaitRate = 1.1 + rnd() * 0.5;
+          }
+          const sp = fast ? 300 + rnd() * 200 : 80 + rnd() * 90;
+          d.vx = Math.cos(head) * sp;
+          d.vy = Math.sin(head) * sp;
+        };
         for (let i = 0; i < TARGET_COUNT; i++) {
-          spawnAt(2 + Math.floor(rnd() * (cols - 3)), Math.floor(rnd() * rows), 0.8 + rnd() * 0.8, rnd() < 0.5 ? 0.2 : 0.85);
+          enterTowardCenter(0.8 + rnd() * 0.8, rnd() < 0.5 ? 0.2 : 0.85, rnd() < 0.4);
         }
         const resConc = [0.18, 0.86];
         let resIdx = 0;
