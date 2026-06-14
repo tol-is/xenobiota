@@ -196,6 +196,10 @@
       const LUNGE_GAP_MIN = 0.6;
       const LUNGE_GAP_MAX = 2.3;
       const STILL_REF = 420; // cursor speed (px/s) that suppresses darts
+      // dwell: once it catches the cursor, cling to it calmly, then lose interest
+      const DWELL_TIME = 5; // seconds spent lingering on the cursor
+      const DWELL_REACH = 0.9; // "reached" when within this × body radius
+      const BORED_TIME = 6; // after dwelling, won't chase again for this long
 
       // ── fright (bolt away after being grabbed and released) ────────────
       const SCARE_TIME = 1.7; // seconds of panicked fleeing after release
@@ -717,6 +721,7 @@
               d.leapCd = LEAP_GAP_MIN + rnd() * (LEAP_GAP_MAX - LEAP_GAP_MIN);
               d.twitchCd = TWITCH_GAP_MIN + rnd() * (TWITCH_GAP_MAX - TWITCH_GAP_MIN);
               d.leapT = 0; d.leapLift = 0; d.tagCd = 0;
+              d.dwell = 0; d.boredCd = 0;
             }
             const panic = d === grabbed;
             const tagging = !!(d.playmate && d.tagT > 0 && dropIndex(d.playmate) >= 0);
@@ -724,7 +729,8 @@
             d.liftAnim = (d.liftAnim || 0) + (liftTarget - (d.liftAnim || 0)) * Math.min(1, dt * 9);
             const pred = d.absorbedBy && dropIndex(d.absorbedBy) >= 0 ? d.absorbedBy : null;
             const absorbing = pred !== null && !panic;
-            const canAct = !panic && !absorbing && !d.entering && !d.lifted;
+            const dwelling = d.dwell > 0;
+            const canAct = !panic && !absorbing && !d.entering && !d.lifted && !dwelling;
 
             let target = d.wander;
             let seeking = false;
@@ -758,14 +764,27 @@
                 const dxc = M.x - d.x;
                 const dyc = M.y - d.y;
                 const dist = Math.hypot(dxc, dyc);
-                if (d.chasing) {
-                  if (dist > LOSE_RADIUS) d.chasing = false;
-                } else if (dist < WAKE_RADIUS) {
+                if (d.boredCd > 0) d.boredCd -= dt;
+                if (d.dwell > 0) {
+                  // caught the cursor → cling to it for a few seconds, calmly,
+                  // then lose interest and wander off
+                  d.dwell -= dt;
                   d.chasing = true;
-                }
-                if (d.chasing && dist > baseR * 0.7) {
-                  target = Math.atan2(dyc, dxc) + 0.55 * Math.sin(elapsed * 0.8 + d.phase);
-                  seeking = true;
+                  if (dist > baseR * 0.7) { target = Math.atan2(dyc, dxc); seeking = true; }
+                  if (d.dwell <= 0) {
+                    d.chasing = false;
+                    d.boredCd = BORED_TIME; // won't re-chase for a while
+                    d.wander = Math.atan2(d.y - M.y, d.x - M.x); // head away
+                  }
+                } else if (d.chasing) {
+                  if (dist > LOSE_RADIUS) d.chasing = false;
+                  else if (dist < baseR * DWELL_REACH) d.dwell = DWELL_TIME; // reached it
+                  if (d.chasing && dist > baseR * 0.7) {
+                    target = Math.atan2(dyc, dxc) + 0.55 * Math.sin(elapsed * 0.8 + d.phase);
+                    seeking = true;
+                  }
+                } else if (dist < WAKE_RADIUS && d.boredCd <= 0) {
+                  d.chasing = true;
                 }
               } else {
                 d.chasing = false;
@@ -800,7 +819,8 @@
 
             // stalk-and-dart: build up between lunges, dart in bursts —
             // darts fire more often the stiller the cursor is held
-            if (d.chasing) {
+            // (suppressed while dwelling so it rests calmly on the cursor)
+            if (d.chasing && d.dwell <= 0) {
               if (d.lunge > 0) d.lunge = Math.max(0, d.lunge - dt / LUNGE_TIME);
               d.lungeCd -= dt * (0.5 + stillness * 1.6);
               if (d.lungeCd <= 0) {
