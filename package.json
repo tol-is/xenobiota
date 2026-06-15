@@ -1,0 +1,19 @@
+{
+  "name": "xenobiota",
+  "version": "1.0.0",
+  "description": "We don't know what it is.",
+  "private": true,
+  "scripts": {
+    "dev": "python3 -m http.server 8000",
+    "test": "echo \"No tests configured\" && exit 0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tol-is/xenobiota.git"
+  },
+  "author": "tol.is",
+  "license": "MIT",
+  "dependencies": {
+    "@vercel/analytics": "^1.4.1"
+  }
+}
